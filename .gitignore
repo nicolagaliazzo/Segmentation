@@ -1,2 +1,22 @@
 images/
 **/images/
+
+# Cartella data (non caricare su GitHub)
+data/
+
+# Virtual environment
+venv/
+.venv/
+venv310/
+
+# Python
+__pycache__/
+*.pyc
+
+# Modelli pesanti
+models/*.keras
+models/checkpoints/*.keras
+
+# Output generati
+outputs/
+
