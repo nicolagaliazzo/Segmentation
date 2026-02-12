@@ -29,23 +29,31 @@ def apply_saturation(img_rgb, factor=0.5):
     hsv[:, :, 1] = np.clip(hsv[:, :, 1] * factor, 0, 255)
     return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
 
+
+def mask_for_save(mask_patch):
+    """Scala la maschera (es. 0,1,2,3) in 0-255 per visibilità nel PNG."""
+    m = np.asarray(mask_patch, dtype=np.float32)
+    mx = float(max(1, m.max()))
+    return (m * (255.0 / mx)).astype(np.uint8)
+
 # ──────────────────────────────────────────────
 # CONFIGURAZIONE - modifica questi percorsi
 # ──────────────────────────────────────────────
 BASE_DIR = r"C:\Users\gdf01\Documents\Segmentation\data\images\newimages_1"
 
-IMAGES_DIR = os.path.join(BASE_DIR, "png")       # cartella immagini PNG
+IMAGES_DIR = os.path.join(BASE_DIR, "jpg")       # cartella immagini
 MASKS_DIR  = os.path.join(BASE_DIR, "masks")      # cartella maschere
 
-# Cartelle di output (verranno create se non esistono)
-OUT_IMAGES_DIR  = os.path.join(BASE_DIR, "augmented", "images")
-OUT_MASKS_DIR   = os.path.join(BASE_DIR, "augmented", "masks")
-OUT_PATCHES_IMG = os.path.join(BASE_DIR, "augmented", "patches_images")
-OUT_PATCHES_MSK = os.path.join(BASE_DIR, "augmented", "patches_masks")
+# Augmentation: non salvata su disco (solo in memoria per generare le patch)
+
+# Patch: salvate in patch_1_256, divise in train (80%) e validation (20%)
+PATCHES_BASE_DIR = r"C:\Users\gdf01\Documents\Segmentation\patch_1_256"
+TRAIN_FRACTION = 0.80   # 80% train, 20% validation
+RANDOM_SEED_SPLIT = 42  # per riproducibilità train/val
 
 # Estensione dei file sorgente
-IMAGE_EXT = "*.jpg"   # immagini in newimages_1/png sono JPG
-MASK_EXT  = "*.tiff"  # maschere in newimages_1/masks sono OME-TIFF
+IMAGE_EXT = "*.jpg"   # immagini in newimages_1/jpg
+MASK_EXT  = "*.tif"   # maschere in newimages_1/masks (estensione .tif)
 
 CROP_ROWS = None  # Imposta a 1280 se vuoi tagliare la scale bar (come nel notebook)
                    # None = nessun crop
@@ -53,14 +61,16 @@ CROP_ROWS = None  # Imposta a 1280 se vuoi tagliare la scale bar (come nel noteb
 PATCH_SIZE = 256   # Dimensione delle patch quadrate
 PATCH_STEP = 256   # Step (non-overlapping se uguale a PATCH_SIZE)
 MIN_POSITIVE_PIXELS = 400   # Salva patch solo se la maschera ha almeno N pixel non neri
+EXCLUDE_TI_IN_NAME = True  # Se True, ignora immagini con "TI" nel nome file
 
 SHOW_PLOTS = False  # True per visualizzare i plot come nel notebook
 
 # ──────────────────────────────────────────────
-# CREAZIONE CARTELLE OUTPUT
+# CREAZIONE CARTELLE OUTPUT (solo per patch)
 # ──────────────────────────────────────────────
-for d in [OUT_IMAGES_DIR, OUT_MASKS_DIR, OUT_PATCHES_IMG, OUT_PATCHES_MSK]:
-    os.makedirs(d, exist_ok=True)
+for split in ("train", "validation"):
+    for sub in ("images", "masks"):
+        os.makedirs(os.path.join(PATCHES_BASE_DIR, split, sub), exist_ok=True)
 
 # ──────────────────────────────────────────────
 # 1. CARICAMENTO IMMAGINI E MASCHERE
@@ -74,6 +84,12 @@ assert len(mask_paths) > 0,  f"Nessuna maschera trovata in {MASKS_DIR}"
 assert len(image_paths) == len(mask_paths), (
     f"Numero immagini ({len(image_paths)}) != numero maschere ({len(mask_paths)})"
 )
+if EXCLUDE_TI_IN_NAME:
+    pairs = [(i, m) for i, m in zip(image_paths, mask_paths) if "TI" not in os.path.basename(i)]
+    image_paths = [p[0] for p in pairs]
+    mask_paths = [p[1] for p in pairs]
+    print(f"Escluse immagini con 'TI' nel nome. Restano {len(image_paths)} coppie immagine/maschera.")
+assert len(image_paths) > 0, "Nessuna immagine rimasta dopo il filtro (es. TI)."
 
 images = [cv2.imread(p, cv2.IMREAD_COLOR) for p in image_paths]   # BGR, 3 canali
 masks  = [cv2.imread(p, cv2.IMREAD_GRAYSCALE) for p in mask_paths]  # grayscale
@@ -95,11 +111,12 @@ print(f"Max pixel value:  {image_dataset.max()}")
 print(f"Classi nella mask: {np.unique(mask_dataset)}")
 
 # ──────────────────────────────────────────────
-# 2. DATA AUGMENTATION — 5 versioni per immagine
+# 2. DATA AUGMENTATION — 5 versioni per immagine (solo in memoria, non salvate su disco)
 #    Originale, Saturazione 0.5 (maschera invariata), Rotazione 90°, Flip H, Flip V
 # ──────────────────────────────────────────────
-print("\nApplicazione augmentation (orig, sat 0.5, rot90, flipH, flipV)...")
+print("\nApplicazione augmentation (orig, sat 0.5, rot90, flipH, flipV) in memoria...")
 
+augmented_list = []   # lista di (img_bgr, mask, name) per generazione patch
 num_images = len(image_dataset)
 
 for i in range(num_images):
@@ -108,56 +125,30 @@ for i in range(num_images):
     base_name = os.path.splitext(os.path.basename(image_paths[i]))[0]
 
     # 1) Originale
-    cv2.imwrite(
-        os.path.join(OUT_IMAGES_DIR, f"{base_name}_orig.png"),
-        cv2.cvtColor(img, cv2.COLOR_RGB2BGR),
-    )
-    cv2.imwrite(os.path.join(OUT_MASKS_DIR, f"{base_name}_orig.png"), msk)
-
-    # 2) Saturazione 0.5 — solo immagine, maschera invariata
+    augmented_list.append((cv2.cvtColor(img, cv2.COLOR_RGB2BGR), msk.copy(), f"{base_name}_orig"))
+    # 2) Saturazione 0.5
     img_sat = apply_saturation(img, factor=0.5)
-    cv2.imwrite(
-        os.path.join(OUT_IMAGES_DIR, f"{base_name}_sat.png"),
-        cv2.cvtColor(img_sat, cv2.COLOR_RGB2BGR),
-    )
-    cv2.imwrite(os.path.join(OUT_MASKS_DIR, f"{base_name}_sat.png"), msk)
-
-    # 3) Rotazione 90° (orario) — immagine e maschera
+    augmented_list.append((cv2.cvtColor(img_sat, cv2.COLOR_RGB2BGR), msk.copy(), f"{base_name}_sat"))
+    # 3) Rotazione 90°
     img_rot = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
     msk_rot = cv2.rotate(msk, cv2.ROTATE_90_CLOCKWISE)
-    cv2.imwrite(
-        os.path.join(OUT_IMAGES_DIR, f"{base_name}_rot90.png"),
-        cv2.cvtColor(img_rot, cv2.COLOR_RGB2BGR),
-    )
-    cv2.imwrite(os.path.join(OUT_MASKS_DIR, f"{base_name}_rot90.png"), msk_rot)
-
+    augmented_list.append((cv2.cvtColor(img_rot, cv2.COLOR_RGB2BGR), msk_rot, f"{base_name}_rot90"))
     # 4) Flip orizzontale
     img_flipH = cv2.flip(img, 1)
     msk_flipH = cv2.flip(msk, 1)
-    cv2.imwrite(
-        os.path.join(OUT_IMAGES_DIR, f"{base_name}_flipH.png"),
-        cv2.cvtColor(img_flipH, cv2.COLOR_RGB2BGR),
-    )
-    cv2.imwrite(os.path.join(OUT_MASKS_DIR, f"{base_name}_flipH.png"), msk_flipH)
-
+    augmented_list.append((cv2.cvtColor(img_flipH, cv2.COLOR_RGB2BGR), msk_flipH, f"{base_name}_flipH"))
     # 5) Flip verticale
     img_flipV = cv2.flip(img, 0)
     msk_flipV = cv2.flip(msk, 0)
-    cv2.imwrite(
-        os.path.join(OUT_IMAGES_DIR, f"{base_name}_flipV.png"),
-        cv2.cvtColor(img_flipV, cv2.COLOR_RGB2BGR),
-    )
-    cv2.imwrite(os.path.join(OUT_MASKS_DIR, f"{base_name}_flipV.png"), msk_flipV)
+    augmented_list.append((cv2.cvtColor(img_flipV, cv2.COLOR_RGB2BGR), msk_flipV, f"{base_name}_flipV"))
 
     if (i + 1) % 10 == 0:
         print(f"  Processate {i + 1}/{num_images}")
 
-expected_total = num_images * 5
-print(f"Augmentation completata: {num_images} immagini × 5 = {expected_total} file.")
-print(f"Salvati in:\n  {OUT_IMAGES_DIR}\n  {OUT_MASKS_DIR}")
+print(f"Augmentation completata: {num_images} immagini x 5 = {len(augmented_list)} versioni (non salvate su disco).")
 
 # ──────────────────────────────────────────────
-# 3. PATCHIFY — Patch 256×256 solo se ≥ MIN_POSITIVE_PIXELS non neri; + bilanciamento negative
+# 3. PATCHIFY — Patch 256x256 solo se >= MIN_POSITIVE_PIXELS non neri; + bilanciamento negative
 # ──────────────────────────────────────────────
 try:
     from patchify import patchify
@@ -166,18 +157,14 @@ except ImportError:
     os.system("pip install patchify")
     from patchify import patchify
 
-print(f"\nCreazione patch {PATCH_SIZE}x{PATCH_SIZE} (solo se maschera ha ≥ {MIN_POSITIVE_PIXELS} pixel non neri)...")
+print(f"\nCreazione patch {PATCH_SIZE}x{PATCH_SIZE} (solo se maschera ha >= {MIN_POSITIVE_PIXELS} pixel non neri)...")
+print(f"Salvataggio in {PATCHES_BASE_DIR} con split train ({TRAIN_FRACTION*100:.0f}%) / validation ({(1-TRAIN_FRACTION)*100:.0f}%)")
 
-aug_img_paths = sorted(glob.glob(os.path.join(OUT_IMAGES_DIR, "*.png")))
-aug_msk_paths = sorted(glob.glob(os.path.join(OUT_MASKS_DIR, "*.png")))
+# Fase 1: raccogli patch positive e candidate negative (da dati augmentation in memoria)
+positive_patches = []   # lista di (patch_img, patch_msk, nome_file)
+negative_candidates = []   # lista di (patch_img,) per patch con maschera tutta zero
 
-positive_count = 0
-negative_candidates = []   # lista di (patch_img, name_prefix) per patch con maschera tutta zero
-
-for img_path, msk_path in zip(aug_img_paths, aug_msk_paths):
-    name = os.path.splitext(os.path.basename(img_path))[0]
-    img = cv2.imread(img_path, cv2.IMREAD_COLOR)
-    msk = cv2.imread(msk_path, cv2.IMREAD_GRAYSCALE)
+for img, msk, name in augmented_list:
 
     h, w = msk.shape[:2]
     new_h = (h // PATCH_SIZE) * PATCH_SIZE
@@ -195,38 +182,49 @@ for img_path, msk_path in zip(aug_img_paths, aug_msk_paths):
             non_zero = np.count_nonzero(patch_msk)
 
             if non_zero >= MIN_POSITIVE_PIXELS:
-                # Patch positiva: salva immagine e maschera
-                cv2.imwrite(
-                    os.path.join(OUT_PATCHES_IMG, f"{name}_p{pi}_{pj}.png"),
-                    patch_img,
-                )
-                cv2.imwrite(
-                    os.path.join(OUT_PATCHES_MSK, f"{name}_p{pi}_{pj}.png"),
-                    patch_msk,
-                )
-                positive_count += 1
+                positive_patches.append((patch_img.copy(), patch_msk.copy(), f"{name}_p{pi}_{pj}"))
             elif non_zero == 0:
-                # Candidata negativa: maschera tutta zero
-                negative_candidates.append((patch_img.copy(), f"{name}_p{pi}_{pj}"))
+                negative_candidates.append((patch_img.copy(),))
 
-print(f"Patch positive (≥ {MIN_POSITIVE_PIXELS} pixel non neri): {positive_count}")
+n_positive = len(positive_patches)
+print(f"Patch positive trovate: {n_positive}")
 
-# Genera lo stesso numero di patch negative (maschera tutta zero)
+# Fase 2: split deterministico 80/20 per le positive (stesso numero train/val per positive e negative)
+random.seed(RANDOM_SEED_SPLIT)
+order = list(range(n_positive))
+random.shuffle(order)
+n_train = int(round(n_positive * TRAIN_FRACTION))
+n_val = n_positive - n_train
+
+# Salva patch positive: prime n_train -> train, rest -> validation
+for idx, pos_idx in enumerate(order):
+    patch_img, patch_msk, base_name = positive_patches[pos_idx]
+    split = "train" if idx < n_train else "validation"
+    out_img_dir = os.path.join(PATCHES_BASE_DIR, split, "images")
+    out_msk_dir = os.path.join(PATCHES_BASE_DIR, split, "masks")
+    cv2.imwrite(os.path.join(out_img_dir, f"{base_name}.png"), patch_img)
+    cv2.imwrite(os.path.join(out_msk_dir, f"{base_name}.png"), mask_for_save(patch_msk))
+
+print(f"Patch positive (>= {MIN_POSITIVE_PIXELS} pixel non neri): {n_positive} (train: {n_train}, validation: {n_val})")
+
+# Fase 3: stesso numero di patch negative, stessa distribuzione (n_train in train, n_val in validation)
 mask_zero = np.zeros((PATCH_SIZE, PATCH_SIZE), dtype=np.uint8)
-n_negative = positive_count
-if len(negative_candidates) < n_negative:
-    # Se non ci sono abbastanza candidate, campiona con ripetizione
-    indices = random.choices(range(len(negative_candidates)), k=n_negative)
+if len(negative_candidates) < n_positive:
+    neg_indices = random.choices(range(len(negative_candidates)), k=n_positive)
 else:
-    indices = random.sample(range(len(negative_candidates)), n_negative)
-
-for idx, save_idx in enumerate(indices):
-    patch_img, _ = negative_candidates[save_idx]
+    neg_indices = random.sample(range(len(negative_candidates)), n_positive)
+random.seed(RANDOM_SEED_SPLIT + 1)
+random.shuffle(neg_indices)
+for idx in range(n_positive):
+    patch_img = negative_candidates[neg_indices[idx]][0]
+    split = "train" if idx < n_train else "validation"
     neg_name = f"neg_{idx:05d}"
-    cv2.imwrite(os.path.join(OUT_PATCHES_IMG, f"{neg_name}.png"), patch_img)
-    cv2.imwrite(os.path.join(OUT_PATCHES_MSK, f"{neg_name}.png"), mask_zero)
+    out_img_dir = os.path.join(PATCHES_BASE_DIR, split, "images")
+    out_msk_dir = os.path.join(PATCHES_BASE_DIR, split, "masks")
+    cv2.imwrite(os.path.join(out_img_dir, f"{neg_name}.png"), patch_img)
+    cv2.imwrite(os.path.join(out_msk_dir, f"{neg_name}.png"), mask_zero)
 
-print(f"Patch negative (maschera tutta zero): {n_negative}")
-print(f"Totale patch: {positive_count} positive + {n_negative} negative = {positive_count + n_negative}")
-print(f"Salvate in:\n  {OUT_PATCHES_IMG}\n  {OUT_PATCHES_MSK}")
+print(f"Patch negative (maschera tutta zero): {n_positive} (train: {n_train}, validation: {n_val})")
+print(f"Totale: {n_positive * 2} patch. In train: {n_train * 2} (pos+neg), in validation: {n_val * 2} (pos+neg).")
+print(f"Salvate in:\n  {PATCHES_BASE_DIR}\n    train/images, train/masks\n    validation/images, validation/masks")
 print("\nDone!")

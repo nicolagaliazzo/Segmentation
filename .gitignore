@@ -19,4 +19,5 @@ models/checkpoints/*.keras
 
 # Output generati
 outputs/
+patch_1_256/
 
